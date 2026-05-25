@@ -27,6 +27,8 @@
 #   --tag-id   INT     AprilTag ID to filter (informational only; filtering done in Unity)
 
 import argparse
+import glob
+import os
 import sys
 
 import numpy as np
@@ -39,10 +41,10 @@ try:
     HAS_ROS = True
 except ImportError:
     HAS_ROS = False
-    print("[warn] rosbag2_py / rclpy not found — ensure ROS 2 is sourced.", file=sys.stderr)
+    print("[warn] rosbag2_py / rclpy not found - ensure ROS 2 is sourced.", file=sys.stderr)
 
 
-# ── Bag reading ───────────────────────────────────────────────────────────────
+# Bag reading 
 
 def read_bag(bag_path: str, topics: list):
     """Read selected topics from a rosbag2 bag.
@@ -89,10 +91,10 @@ def read_bag(bag_path: str, topics: list):
     )
 
 
-# ── Pose conversion ───────────────────────────────────────────────────────────
+# Pose conversion
 
 def posestamped_to_matrix(msg) -> np.ndarray:
-    """Convert geometry_msgs/PoseStamped to a 4×4 homogeneous transform (float64)."""
+    """Convert geometry_msgs/PoseStamped to a 4x4 homogeneous transform (float64)."""
     p = msg.pose.position
     q = msg.pose.orientation  # x, y, z, w
 
@@ -116,13 +118,13 @@ def posestamped_to_matrix(msg) -> np.ndarray:
     return T
 
 
-# ── Synchronisation ───────────────────────────────────────────────────────────
+# Synchronisation
 
 def sync_pairs(tool0_msgs: list, tag_msgs: list,
                max_dt_ms: float = 50.0) -> list:
     """Match each tool0 message to the nearest-timestamp tag message.
 
-    Returns list of (T_tool0 4×4, T_tag 4×4) pairs within max_dt_ms.
+    Returns list of (T_tool0 4x4, T_tag 4x4) pairs within max_dt_ms.
     """
     if not tag_msgs:
         return []
@@ -146,7 +148,8 @@ def sync_pairs(tool0_msgs: list, tag_msgs: list,
 def filter_by_rotation(pairs: list, min_rot_deg: float = 3.0) -> list:
     """Drop consecutive pairs where the EEF rotation change is below min_rot_deg.
 
-    Near-zero rotation pairs are ill-conditioned for Tsai-Lenz stage 1.
+    Near-zero rotation is ill-conditioned for the solver. See rosbag_recording.md
+    for the rotation angle formula and why this filter matters.
     """
     if not pairs:
         return pairs
@@ -165,7 +168,8 @@ def filter_by_rotation(pairs: list, min_rot_deg: float = 3.0) -> list:
     return filtered
 
 
-# ── Solver ────────────────────────────────────────────────────────────────────
+# Solver
+
 
 _METHODS = {
     "tsai":       cv2.CALIB_HAND_EYE_TSAI,
@@ -177,12 +181,15 @@ _METHODS = {
 
 
 def solve(pairs: list, method_name: str = "tsai") -> np.ndarray:
-    """Run cv2.calibrateHandEye and return T_tool0_to_camera (4×4, float64).
+    """Run cv2.calibrateHandEye and return T_tool0_to_camera (4x4, float64).
 
-    calibrateHandEye signature (eye-in-hand):
-        R_gripper2base, t_gripper2base  — EEF pose in base frame   (= tool0_pose)
-        R_target2cam,   t_target2cam    — tag pose in camera frame  (= apriltag_pose)
-    Returns R_cam2gripper, t_cam2gripper  →  T_tool0_to_camera (X in AX = XB).
+    Solves AX = XB (eye-in-hand). See rosbag_recording.md for the full
+    derivation of A, B, and the asymmetric B order that matters for residual.
+
+    cv2.calibrateHandEye expects:
+        R_gripper2base, t_gripper2base  - EEF pose in base frame   (= tool0_pose)
+        R_target2cam,   t_target2cam    - tag pose in camera frame  (= apriltag_pose)
+    Returns R_cam2gripper, t_cam2gripper  ->  T_tool0_to_camera (X in AX = XB).
     """
     method = _METHODS.get(method_name.lower(), cv2.CALIB_HAND_EYE_TSAI)
 
@@ -204,12 +211,13 @@ def solve(pairs: list, method_name: str = "tsai") -> np.ndarray:
 def compute_residual(pairs: list, T_x: np.ndarray) -> float:
     """Mean rotation residual in degrees across all AX = XB pairs.
 
-    A value below 2 deg indicates a well-conditioned result.
+    See rosbag_recording.md for the residual formula and thresholds.
+    Below 2 deg is good. Above 5 deg needs more rotation-diverse poses.
     """
     errors = []
     for i in range(1, len(pairs)):
         A = np.linalg.inv(pairs[i - 1][0]) @ pairs[i][0]
-        B = np.linalg.inv(pairs[i - 1][1]) @ pairs[i][1]
+        B = pairs[i - 1][1] @ np.linalg.inv(pairs[i][1])
         lhs = A @ T_x
         rhs = T_x @ B
         R_err = lhs[:3, :3].T @ rhs[:3, :3]
@@ -218,10 +226,10 @@ def compute_residual(pairs: list, T_x: np.ndarray) -> float:
     return float(np.mean(errors)) if errors else float("nan")
 
 
-# ── Output formatting ─────────────────────────────────────────────────────────
+# Output formatting
 
 def matrix_to_quat(R: np.ndarray):
-    """Rotation matrix → quaternion (x, y, z, w)."""
+    """Rotation matrix -> quaternion (x, y, z, w) using Shepperd's method."""
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
         s = 0.5 / np.sqrt(trace + 1.0)
@@ -254,41 +262,46 @@ def print_result(T: np.ndarray, n_pairs: int, residual_deg: float, method: str):
     t = T[:3, 3]
     q = matrix_to_quat(T[:3, :3])
     print()
-    print("── Hand-Eye Calibration Result ─────────────────────────────────────")
+    print("Hand-Eye Calibration Result")
     print(f"  Method      : {method}")
     print(f"  Pairs used  : {n_pairs}")
-    print(f"  Residual    : {residual_deg:.3f} deg  {'✓ good' if residual_deg < 2.0 else '⚠ high — check pose diversity'}")
+    print(f"  Residual    : {residual_deg:.3f} deg  {'(good)' if residual_deg < 2.0 else '(high - check pose diversity)'}")
     print(f"  Translation : x={t[0]: .6f}  y={t[1]: .6f}  z={t[2]: .6f}  (metres, FLU)")
     print(f"  Quaternion  : x={q[0]: .6f}  y={q[1]: .6f}  z={q[2]: .6f}  w={q[3]: .6f}")
     print()
-    print("  T_tool0_to_camera (4×4, FLU convention):")
+    print("  T_tool0_to_camera (4x4, FLU convention):")
     for row in T:
         print("    " + "  ".join(f"{v:10.6f}" for v in row))
     print()
-    print("── Apply to Unity (HandEyeDataPublisher transform) ─────────────────")
+    print("Apply to Unity (HandEyeDataPublisher transform)")
     print(f"  localPosition = new Vector3({t[0]:.6f}f,  {t[1]:.6f}f,  {t[2]:.6f}f);  // FLU metres")
     print(f"  // Convert to Unity: x=-y_flu, y=z_flu, z=x_flu")
     ux, uy, uz = -t[1], t[2], t[0]
-    print(f"  // Unity localPosition ≈ ({ux:.6f}f, {uy:.6f}f, {uz:.6f}f)")
+    print(f"  // Unity localPosition ~ ({ux:.6f}f, {uy:.6f}f, {uz:.6f}f)")
     print()
-    print("── static_transform_publisher (paste into launch file) ──────────────")
+    print("static_transform_publisher (paste into launch file)")
     print(f"  ros2 run tf2_ros static_transform_publisher \\")
     print(f"    {t[0]:.6f} {t[1]:.6f} {t[2]:.6f} \\")
     print(f"    {q[0]:.6f} {q[1]:.6f} {q[2]:.6f} {q[3]:.6f} \\")
     print(f"    tool0 camera_optical_frame")
-    print("─────────────────────────────────────────────────────────────────────")
     print()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# Entry point
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Offline hand-eye calibration solver — reads rosbag2, outputs T_tool0_to_camera."
+        description="Offline hand-eye calibration solver. Reads rosbag2, outputs T_tool0_to_camera."
     )
     parser.add_argument(
-        "--bag", required=True, nargs="+", metavar="PATH",
-        help="Path(s) to rosbag2 bag directory. Multiple bags are merged before solving."
+        "--bag", nargs="+", metavar="PATH",
+        help="Path(s) to rosbag2 bag directory. Glob patterns are supported "
+             "(e.g. /path/to/handeye_bag_*). Multiple bags are merged before solving."
+    )
+    parser.add_argument(
+        "--bag-dir", metavar="DIR",
+        help="Directory containing bag folders. All subdirectories are used as bags, "
+             "sorted by name. Equivalent to --bag <DIR>/*/."
     )
     parser.add_argument(
         "--method", default="tsai",
@@ -305,6 +318,25 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve bag paths from --bag (with glob expansion) and/or --bag-dir
+    bag_paths = []
+    if args.bag:
+        for pattern in args.bag:
+            expanded = sorted(glob.glob(pattern))
+            if expanded:
+                bag_paths.extend(p for p in expanded if os.path.isdir(p))
+            else:
+                bag_paths.append(pattern)  # pass through; read_bag will report the error
+    if args.bag_dir:
+        bag_paths.extend(sorted(
+            p for p in glob.glob(os.path.join(args.bag_dir, "*"))
+            if os.path.isdir(p)
+        ))
+    if not bag_paths:
+        print("[handeye_solver] ERROR: No bags specified. Use --bag or --bag-dir.",
+              file=sys.stderr)
+        sys.exit(1)
+
     TOOL0_TOPIC  = "/unity/tool0_pose"
     APRILTAG_TOPIC = "/unity/apriltag_pose"
     topics = [TOOL0_TOPIC, APRILTAG_TOPIC]
@@ -313,7 +345,7 @@ def main():
     all_tool0 = []
     all_tags  = []
 
-    for bag_path in args.bag:
+    for bag_path in bag_paths:
         print(f"[handeye_solver] Reading: {bag_path}")
         msgs = read_bag(bag_path, topics)
         all_tool0.extend(msgs[TOOL0_TOPIC])
@@ -326,7 +358,7 @@ def main():
     print(f"[handeye_solver] Synchronised pairs: {len(pairs)}")
 
     pairs = filter_by_rotation(pairs, min_rot_deg=args.min_rot)
-    print(f"[handeye_solver] After rotation filter (>={args.min_rot}°): {len(pairs)}")
+    print(f"[handeye_solver] After rotation filter (>={args.min_rot} deg): {len(pairs)}")
 
     if len(pairs) < 3:
         print(
