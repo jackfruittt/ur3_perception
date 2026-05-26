@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'yolo_detector = ur3_perception.yolo_detector:main',
             'handeye_solver = ur3_perception.handeye_solver:main',
+            'colour_button_detector = ur3_perception.colour_button_detector:main',
         ],
     },
 )
