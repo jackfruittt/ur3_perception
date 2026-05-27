@@ -35,15 +35,21 @@
 #   depth_sample_radius (int,    default 3)     - half-window for median depth sample
 #   publish_debug_image (bool,   default false)
 #   use_cuda            (bool,   default true)  - use cv2.cuda for BGR->HSV if available
+#   clahe_clip          (double, default 2.0)   - CLAHE clip limit for V channel; 0.0 = disabled
+#   min_circularity     (double, default 0.55)  - contour circularity filter [0,1]; 0.0 = disabled
+#   depth_gate_min      (double, default 0.0)   - min depth in metres to accept; 0.0 = disabled
+#   depth_gate_max      (double, default 0.0)   - max depth in metres to accept; 0.0 = disabled
 #
 # Button JSON format:
 #   [
-#     {"label": "red",   "h_lo":   0, "h_hi":  10, "s_lo": 80, "v_lo": 60},
-#     {"label": "red",   "h_lo": 170, "h_hi": 180, "s_lo": 80, "v_lo": 60},
-#     {"label": "green", "h_lo":  40, "h_hi":  80, "s_lo": 80, "v_lo": 60},
-#     {"label": "blue",  "h_lo": 100, "h_hi": 130, "s_lo": 80, "v_lo": 60}
+#     {"label": "red",   "h_lo":   0, "h_hi":  10, "s_lo": 80, "v_lo": 60, "v_hi": 240},
+#     {"label": "red",   "h_lo": 170, "h_hi": 180, "s_lo": 80, "v_lo": 60, "v_hi": 240},
+#     {"label": "green", "h_lo":  40, "h_hi":  80, "s_lo": 80, "v_lo": 60, "v_hi": 240},
+#     {"label": "blue",  "h_lo": 100, "h_hi": 130, "s_lo": 80, "v_lo": 60, "v_hi": 240}
 #   ]
 #
+# v_hi (optional, default 255) caps the brightness upper bound - set to ~240 to reject
+# specular white highlights caused by angled lighting.
 # Red wraps around hue=0 in OpenCV HSV (0-179), so define two entries with
 # the same label - they are OR-ed together before contour finding.
 #
@@ -75,15 +81,16 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from launch_ros.parameter_descriptions import ParameterValue
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
 _DEFAULT_BUTTONS = json.dumps([
-    {"label": "red",   "h_lo":   0, "h_hi":  10, "s_lo": 80, "v_lo": 60},
-    {"label": "red",   "h_lo": 170, "h_hi": 180, "s_lo": 80, "v_lo": 60},
-    {"label": "green", "h_lo":  40, "h_hi":  80, "s_lo": 80, "v_lo": 60},
-    {"label": "blue",  "h_lo": 100, "h_hi": 130, "s_lo": 80, "v_lo": 60},
+    {"label": "yellow","h_lo":  21, "h_hi":  93, "s_lo": 107, "s_hi": 167, "v_lo": 176, "v_hi": 255},
+    {"label": "red",   "h_lo": 170, "h_hi": 179, "s_lo":  95, "s_hi": 255, "v_lo": 158, "v_hi": 255},
+    {"label": "green", "h_lo":  79, "h_hi": 103, "s_lo":  63, "s_hi": 255, "v_lo": 133, "v_hi": 204},
+    {"label": "blue",  "h_lo":  96, "h_hi": 179, "s_lo": 167, "s_hi": 255, "v_lo":  87, "v_hi": 215},
 ])
 
 
@@ -109,18 +116,27 @@ class ColourButtonDetectorNode(Node):
         self.declare_parameter('depth_sample_radius', 3)     # half-window for median depth
         self.declare_parameter('publish_debug_image', False)
         self.declare_parameter('use_cuda',            True)
+        self.declare_parameter('clahe_clip',          2.0)   # CLAHE clip limit; 0.0 = disabled
+        self.declare_parameter('min_circularity',     0.55)  # 0.0 = disabled, 1.0 = perfect circle
+        self.declare_parameter('depth_gate_min',      0.0)   # metres; 0.0 = disabled
+        self.declare_parameter('depth_gate_max',      0.0)   # metres; 0.0 = disabled
 
         image_topic       = self.get_parameter('image_topic').value
         depth_topic       = self.get_parameter('depth_topic').value
         camera_info_topic = self.get_parameter('camera_info_topic').value
-        self._min_area     = int(self.get_parameter('min_area').value)
-        self._max_area     = int(self.get_parameter('max_area').value)
-        self._pub_dbg      = self.get_parameter('publish_debug_image').value
-        self._depth_radius = int(self.get_parameter('depth_sample_radius').value)
-        detection_hz       = float(self.get_parameter('detection_hz').value)
-        self._det_interval = 1.0 / max(detection_hz, 0.1)
-        self._last_det_time = 0.0
-        want_cuda           = bool(self.get_parameter('use_cuda').value)
+        self._min_area        = int(self.get_parameter('min_area').value)
+        self._max_area        = int(self.get_parameter('max_area').value)
+        self._pub_dbg         = self.get_parameter('publish_debug_image').value
+        self._depth_radius    = int(self.get_parameter('depth_sample_radius').value)
+        detection_hz          = float(self.get_parameter('detection_hz').value)
+        self._det_interval    = 1.0 / max(detection_hz, 0.1)
+        self._last_det_time   = 0.0
+        want_cuda             = bool(self.get_parameter('use_cuda').value)
+        clahe_clip            = float(self.get_parameter('clahe_clip').value)
+        self._min_circ        = float(self.get_parameter('min_circularity').value)
+        self._depth_gate_min  = float(self.get_parameter('depth_gate_min').value)
+        self._depth_gate_max  = float(self.get_parameter('depth_gate_max').value)
+        self._clahe           = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8)) if clahe_clip > 0.0 else None
 
         try:
             self._buttons = json.loads(self.get_parameter('buttons').value)
@@ -226,6 +242,22 @@ class ColourButtonDetectorNode(Node):
         else:
             hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
+        # CLAHE on V channel - normalises brightness across the frame so buttons
+        # in shadow and buttons under direct light share the same thresholds
+        if self._clahe is not None:
+            h_ch, s_ch, v_ch = cv2.split(hsv)
+            v_ch = self._clahe.apply(v_ch)
+            hsv  = cv2.merge([h_ch, s_ch, v_ch])
+
+        # Depth gate - zero out pixels outside the expected button depth range
+        # before HSV thresholding to suppress background false-positives
+        depth_gate_mask = None
+        if (self._depth_gate_min > 0.0 or self._depth_gate_max > 0.0) and self._depth_frame is not None:
+            z_mm  = self._depth_frame.astype(np.float32)
+            lo_mm = self._depth_gate_min * 1000.0 if self._depth_gate_min > 0.0 else 0.0
+            hi_mm = self._depth_gate_max * 1000.0 if self._depth_gate_max > 0.0 else 1e9
+            depth_gate_mask = ((z_mm >= lo_mm) & (z_mm <= hi_mm) & (z_mm > 0)).astype(np.uint8) * 255
+
         detections  = []
         debug_frame = bgr.copy() if self._pub_dbg else None
 
@@ -233,9 +265,11 @@ class ColourButtonDetectorNode(Node):
         label_masks: dict = {}
         for btn in self._buttons:
             label = btn['label']
-            lo    = np.array([btn['h_lo'], btn.get('s_lo', 80), btn.get('v_lo', 60)], dtype=np.uint8)
-            hi    = np.array([btn['h_hi'], 255,                 255               ], dtype=np.uint8)
+            lo    = np.array([btn['h_lo'], btn.get('s_lo',  80), btn.get('v_lo',  60)], dtype=np.uint8)
+            hi    = np.array([btn['h_hi'], btn.get('s_hi', 255), btn.get('v_hi', 255)], dtype=np.uint8)
             mask  = cv2.inRange(hsv, lo, hi)
+            if depth_gate_mask is not None:
+                cv2.bitwise_and(mask, depth_gate_mask, dst=mask)
             if label in label_masks:
                 cv2.bitwise_or(label_masks[label], mask, dst=label_masks[label])
             else:
@@ -254,6 +288,13 @@ class ColourButtonDetectorNode(Node):
                 area = cv2.contourArea(cnt)
                 if area < self._min_area or area > self._max_area:
                     continue
+
+                # circularity filter - rejects specular streaks and partial blobs
+                if self._min_circ > 0.0:
+                    perimeter = cv2.arcLength(cnt, True)
+                    circularity = (4.0 * np.pi * area / (perimeter ** 2)) if perimeter > 0 else 0.0
+                    if circularity < self._min_circ:
+                        continue
 
                 bx, by, bw, bh = cv2.boundingRect(cnt)
                 x1, y1, x2, y2 = bx, by, bx + bw, by + bh

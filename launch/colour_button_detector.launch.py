@@ -3,16 +3,18 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 # Default button colour definitions.
 # Red wraps around hue=0 in OpenCV HSV (0-179), so two entries share the
 # same label - they are OR-ed together before contour finding.
 # Tune h_lo/h_hi/s_lo/v_lo per your lighting and button colours.
 _DEFAULT_BUTTONS = json.dumps([
-    {"label": "red",   "h_lo":   0, "h_hi":  10, "s_lo": 80, "v_lo": 60},
-    {"label": "red",   "h_lo": 170, "h_hi": 180, "s_lo": 80, "v_lo": 60},
-    {"label": "green", "h_lo":  40, "h_hi":  80, "s_lo": 80, "v_lo": 60},
-    {"label": "blue",  "h_lo": 100, "h_hi": 130, "s_lo": 80, "v_lo": 60},
+    {"label": "yellow","h_lo":  21, "h_hi":  93, "s_lo": 107, "s_hi": 167, "v_lo": 176, "v_hi": 255},
+    {"label": "red",   "h_lo":   0, "h_hi":  10, "s_lo":  95, "s_hi": 255, "v_lo": 158, "v_hi": 255},
+    {"label": "red",   "h_lo": 170, "h_hi": 179, "s_lo":  95, "s_hi": 255, "v_lo": 158, "v_hi": 255},
+    {"label": "green", "h_lo":  79, "h_hi": 103, "s_lo":  63, "s_hi": 255, "v_lo": 133, "v_hi": 204},
+    {"label": "blue",  "h_lo":  96, "h_hi": 179, "s_lo": 167, "s_hi": 255, "v_lo":  87, "v_hi": 215},
 ])
 
 
@@ -82,7 +84,7 @@ def generate_launch_description():
                 'image_topic':         LaunchConfiguration('image_topic'),
                 'depth_topic':         LaunchConfiguration('depth_topic'),
                 'camera_info_topic':   LaunchConfiguration('camera_info_topic'),
-                'buttons':             LaunchConfiguration('buttons'),
+                'buttons':             ParameterValue(LaunchConfiguration('buttons'), value_type=str),
                 'min_area':            LaunchConfiguration('min_area'),
                 'max_area':            LaunchConfiguration('max_area'),
                 'detection_hz':        LaunchConfiguration('detection_hz'),
